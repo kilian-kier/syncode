@@ -1,0 +1,127 @@
+start: header method_body
+
+?header: keyword_header
+       | binary_header
+       | unary_header
+
+?keyword_header: (KEYWORD IDENTIFIER)+
+?binary_header: binary_selector_token IDENTIFIER
+?unary_header: IDENTIFIER
+
+method_body: pragmas? temporaries? statements?
+
+statements: return_statement DOT?
+          | expression (DOT expression)* [DOT return_statement] DOT?
+?statement: expression
+          | return_statement
+?return_statement: CARET expression
+
+temporaries: PIPE IDENTIFIER* PIPE
+
+?expression: assignment
+           | cascade
+           | keyword_send
+
+assignment: IDENTIFIER ASSIGN expression
+
+cascade: keyword_send (SEMICOLON cascade_message)+
+
+?cascade_message: keyword_part
+                | binary_part
+                | unary_part
+
+?keyword_send: binary_send keyword_part?
+?keyword_part: (KEYWORD binary_send)+
+
+?binary_send: unary_send (binary_selector_token unary_send)*
+?binary_part: binary_selector_token unary_send
+
+?unary_send: primary IDENTIFIER*
+?unary_part: IDENTIFIER
+
+?binary_selector_token: BINARY_SELECTOR
+                   | PIPE+
+                   | AND+
+                   | COMMA+
+                   | LT+
+                   | GT+
+                   | EQUAL+
+
+?primary: literal
+        | block
+        | dynamic_array
+        | "(" expression ")"
+        | IDENTIFIER
+
+block: "[" [block_params PIPE] [temporaries] [statements] "]"
+block_params: (":" IDENTIFIER)+
+
+dynamic_array: "{" [statements] "}"
+
+pragmas: pragma+
+?pragma: LT pragma_message GT
+?pragma_message: keyword_pragma | binary_pragma | unary_pragma
+
+?unary_pragma: IDENTIFIER
+?binary_pragma: binary_selector_token pragma_argument
+?keyword_pragma: (KEYWORD pragma_argument)+
+
+?pragma_argument: literal | IDENTIFIER
+
+?literal: NUMBER
+        | STRING
+        | CHARACTER
+        | SYMBOL
+        | literal_array
+        | byte_array_literal
+        | "true"
+        | "false"
+        | "nil"
+        | "self"
+        | "super"
+        | "thisContext"
+
+literal_array: "#(" literal_array_element* ")"
+byte_array_literal: "#[" NUMBER* "]"
+
+?literal_array_element: literal
+                      | nested_literal_array
+                      | IDENTIFIER
+                      | KEYWORD
+                      | binary_selector_token
+                      | DOT
+                      | CARET
+                      | SEMICOLON
+                      | ASSIGN
+                      | "["
+                      | "]"
+                      | "{"
+                      | "}"
+
+nested_literal_array: "(" literal_array_element* ")"
+
+PIPE.3: "|"
+AND: "&"
+LT: "<"
+GT: ">"
+COMMA: ","
+EQUAL: "="
+ASSIGN: ":="
+DOT: "."
+SEMICOLON: ";"
+CARET: "^"
+
+NUMBER.2: /-?(\d+r[0-9A-Z]+(\.[0-9A-Z]+)?|\d+(\.\d+)?)([edq][+-]?\d+|s\d*)?(?![a-zA-Z0-9])/i
+KEYWORD.2: /[A-Za-z_]\w*:/
+CHARACTER.2: /\$./
+SYMBOL.2: /#([A-Za-z_][A-Za-z0-9_:]*|[-+*\/\\~<>=@,%&?!|,]+|'([^']|'')*')/
+
+BINARY_SELECTOR.1: /([-+*\/\\~<>=@,%&?!|]{2,}|[-+*\/\\~@%&?!])/
+
+IDENTIFIER: /[A-Za-z_]\w*/
+STRING: /'([^']|'')*'/
+COMMENT: /"[^"]*"/
+
+%import common.WS
+%ignore WS
+%ignore COMMENT
