@@ -6,6 +6,7 @@ from syncode.parsers.incremental_parser import IncrementalParser, ParseResult
 from syncode.parsers import create_parser, create_base_parser
 from syncode.mask_store.mask_store import MaskStore
 from syncode.parsers.grammars import Grammar
+from syncode.larkm.exceptions import LarkError
 import logging
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,10 @@ class GrammarConstrainer:
                 dev_mode=False,
                 parser='lalr',
                 mode='grammar_mask',
-                indent=False
+                indent=False,
+                fim_special_tokens = ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>"),
+                ignore_fim_suffix=True,
+                spm_mode = False
                 ):
         
         self.tokenizer = tokenizer
@@ -62,6 +66,13 @@ class GrammarConstrainer:
         self.dev_mode = dev_mode
         self.batch_size = batch_size
         self.parse_failed = False
+        self.ignore_fim_suffix = ignore_fim_suffix
+        self.spm_mode = spm_mode
+
+        # FIM tokens
+        self.prefix_token_id = self.tokenizer.get_vocab().get(fim_special_tokens[0], None)
+        self.suffix_token_id = self.tokenizer.get_vocab().get(fim_special_tokens[1], None)
+        self.middle_token_id = self.tokenizer.get_vocab().get(fim_special_tokens[2], None)
 
         # For backtracking to syntactically valid completions
         self.last_valid_state = [0 for _ in range(self.batch_size)]
@@ -123,30 +134,95 @@ class GrammarConstrainer:
 
         input_ids = torch.cat((input_ids, next_token.unsqueeze(0)), dim=-1)
         partial_output, remainder_bytes = self._get_partial_outputs(input_ids)[0]
+        prefix, suffix, completion = '', '', ''
 
-        res, skip = self._parse_partial_output(
-            idx=0, 
-            partial_output=partial_output, 
-            remainder_bytes=remainder_bytes, 
-            accepted_generation=False
-            )
+        fim_parts = self._get_fim_parts(input_ids[0])
+        if fim_parts:
+            prefix, suffix, completion = fim_parts
+            try:
+                self.inc_parser.get_acceptable_next_terminals(prefix)
+            except LarkError as e:
+                self.parse_failed = True
+                logger.info("FIM prefix parsing failed! Falling back to unconstrained decoding.")
+                logger.debug(f"Exception: {e}")
+                return True
+
+            res, skip = self._parse_partial_output(
+                idx=0, 
+                partial_output=prefix + completion, 
+                remainder_bytes=remainder_bytes, 
+                accepted_generation=False
+                )
+        else:
+            res, skip = self._parse_partial_output(
+                idx=0, 
+                partial_output=partial_output, 
+                remainder_bytes=remainder_bytes, 
+                accepted_generation=False
+                )
         
-        if skip: return False
+        if skip: 
+            return False
         
         if input_ids[0, -1] == self.tokenizer.eos_token_id:
             # Do not allow the model to generate EOS token until $END in the grammar is reached
+            fim_parts = self._get_fim_parts(input_ids[0])
+            if fim_parts:
+                if self.ignore_fim_suffix:
+                    return True
+                prefix, suffix, completion = fim_parts
+                return self._check_full_fim_code(prefix, completion, suffix)
             return AcceptSequence(['$END']) in res.accept_sequences
         
         if res.remainder_state == RemainderState.COMPLETE or res.remainder_state == RemainderState.MAYBE_COMPLETE:
             is_valid = True
-
-        # Check if the remainder is a valid prefix for the last terminal
-        is_valid = self.dfa_mask_store.is_valid_prefix(res)
+        else:
+            is_valid = self.dfa_mask_store.is_valid_prefix(res)
 
         if is_valid:
-            self._update_valid_state(partial_output, 0, res)
+            if fim_parts:
+                self._update_valid_state(prefix + completion, 0, res)
+            else:
+                self._update_valid_state(partial_output, 0, res)
 
         return is_valid
+
+    def _get_fim_parts(self, input_ids: torch.LongTensor) -> tuple[str, str, str] | None:
+        if any(x is None for x in (self.prefix_token_id, self.suffix_token_id, self.middle_token_id)):
+            return None
+        
+        p_indices = (input_ids == self.prefix_token_id).nonzero(as_tuple=True)[0]
+        s_indices = (input_ids == self.suffix_token_id).nonzero(as_tuple=True)[0]
+        m_indices = (input_ids == self.middle_token_id).nonzero(as_tuple=True)[0]
+
+        if len(p_indices) != 1 or len(s_indices) != 1 or len(m_indices) != 1:
+            return None
+        
+        p_idx = p_indices[0].item()
+        s_idx = s_indices[0].item()
+        m_idx = m_indices[0].item()
+
+        if self.spm_mode:
+            if not (s_idx <= p_idx <= m_idx):
+                return None
+        else:
+            if not (p_idx <= s_idx <= m_idx):
+                return None
+
+        if self.spm_mode:
+            suffix, _ = self._bytes_to_string(self.byte_tokenizer.decode(input_ids[s_idx + 1: p_idx].tolist(), skip_special_tokens=True))
+            prefix, _ = self._bytes_to_string(self.byte_tokenizer.decode(input_ids[p_idx + 1: m_idx].tolist(), skip_special_tokens=True))
+        else:
+            prefix, _ = self._bytes_to_string(self.byte_tokenizer.decode(input_ids[p_idx + 1 : s_idx].tolist(), skip_special_tokens=True))
+            suffix, _ = self._bytes_to_string(self.byte_tokenizer.decode(input_ids[s_idx + 1 : m_idx].tolist(), skip_special_tokens=True))
+
+        completion, _ = self._bytes_to_string(self.byte_tokenizer.decode(input_ids[m_idx + 1 :].tolist(), skip_special_tokens=True))
+
+        return prefix, suffix, completion
+
+    def _check_full_fim_code(self, prefix: str, completion: str, suffix: str, allow_incomplete: bool = True) -> bool:
+        partial_code = prefix + completion
+        return self.inc_parser.check_continuation(partial_code, suffix, allow_incomplete=allow_incomplete)
 
     def mask_scores(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:    
         """
@@ -169,11 +245,31 @@ class GrammarConstrainer:
 
         for idx, (partial_output, remainder_bytes) in enumerate(partial_outputs):
             # 1. Parsing
-            res, skip = self._parse_partial_output(idx, partial_output, remainder_bytes, accepted_generation=True)
+            fim_parts = self._get_fim_parts(input_ids[idx])
+            if fim_parts:
+                prefix, suffix, completion = fim_parts
+                # If the prefix itself is invalid, we fallback to unconstrained
+                try:
+                    self.inc_parser.get_acceptable_next_terminals(prefix)
+                except LarkError as e:
+                    self.parse_failed = True
+                    logger.info("FIM prefix parsing failed! Falling back to unconstrained decoding.")
+                    logger.debug(f"Exception: {e}")
+                    continue
+
+                res, skip = self._parse_partial_output(idx, prefix + completion, remainder_bytes, accepted_generation=True)
+            else:
+                res, skip = self._parse_partial_output(idx, partial_output, remainder_bytes, accepted_generation=True)
+            
             if skip: continue
 
             # 2. Computing the accept mask
             accept_mask = self.dfa_mask_store.get_accept_mask(res)
+
+            # 2.5 FIM check for EOS and verify that prefix+completion+suffix is valid
+            if fim_parts and not self.ignore_fim_suffix and accept_mask[self.tokenizer.eos_token_id]:
+                if not self._check_full_fim_code(prefix, partial_output, suffix):
+                    accept_mask[self.tokenizer.eos_token_id] = False
 
             # 3. Masking the scores
             if torch.sum(accept_mask) != 0: # If there are acceptable tokens for the current partial code 

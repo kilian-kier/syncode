@@ -233,3 +233,28 @@ class IncrementalParser:
             # If it is the final token that gave the error, then it is okay
             self.cur_ac_terminals = self.next_ac_terminals
             self.next_ac_terminals = set()
+        
+    def check_continuation(self, partial_code: str, suffix: str, allow_incomplete: bool = True) -> bool:
+        full_code = partial_code + suffix
+        lexer_tokens, lexing_incomplete = self._lex_code(full_code)
+
+        if lexing_incomplete:
+            return False
+
+        self._restore_recent_parser_state(lexer_tokens)
+
+        temp_interactive = copy.copy(self.interactive)
+        temp_interactive.parser_state = self.interactive.parser_state.copy()
+        
+        try:
+            for i in range(self.cur_pos, len(lexer_tokens)):
+                temp_interactive.feed_token(lexer_tokens[i])
+            if allow_incomplete:
+                return True
+            else:
+                return '$END' in temp_interactive.accepts()
+        except lark.exceptions.LarkError:
+            return False
+        except Exception as e:
+            logger.debug(f"FIM check failed with exception: {e}")
+            return False
